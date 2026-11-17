@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from app.seed import SEED_ROWS
@@ -14,6 +15,13 @@ class Store:
         self._tables: dict[str, list[dict[str, Any]]] = {
             name: [dict(row) for row in rows] for name, rows in SEED_ROWS.items()
         }
+        # 跨模块写操作（退役传播、替代策略切换、批次导入）都走同一把锁，
+        # 保证推荐结果与复用次数落在同一版本边界里，并发上传不会拿到中间态。
+        self.lock = threading.RLock()
+        # 推荐召回修复明细数据集：退役传播与批次导入生成的校正记录统一留档，
+        # 并同步挂到运营策略的待处理明细上，供业务版本材料核对。
+        self._repairs: list[dict[str, Any]] = []
+        self._repair_seq = 0
 
     def module_names(self) -> list[str]:
         return sorted(self._tables)
@@ -26,6 +34,17 @@ class Store:
             if int(row.get("id", 0)) == entry_id:
                 return row
         return None
+
+    def repairs(self) -> list[dict[str, Any]]:
+        """推荐召回修复明细数据集（全量留档）。"""
+        return self._repairs
+
+    def next_repair_code(self) -> str:
+        self._repair_seq += 1
+        return f"FIX-{self._repair_seq:04d}"
+
+    def add_repair(self, record: dict[str, Any]) -> None:
+        self._repairs.append(record)
 
     def overview(self) -> dict[str, object]:
         modules: list[dict[str, object]] = []

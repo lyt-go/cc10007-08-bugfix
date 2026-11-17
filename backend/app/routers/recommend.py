@@ -1,9 +1,11 @@
 """智能推荐接口：维护推荐策略，覆盖提交策略评审、上线策略、下线策略等动作。"""
 from __future__ import annotations
 
+import json
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, HTTPException, Query, UploadFile
+from pydantic import BaseModel, Field
 
 from app.schemas import ActionResult, EntryPayload, PageResult
 from app.services.recommend import RecommendService
@@ -14,6 +16,38 @@ service = RecommendService()
 
 LIST_FIELDS = ["策略编号", "推荐场景", "召回算法", "排序模型", "冷启动策略", "多样性权重", "刷新频率", "推荐条数上限"]
 STATUSES = ["草稿", "策略评审中", "已上线", "已下线"]
+
+
+class RepairImportPayload(BaseModel):
+    """推荐召回修复明细批次：items 为批量明细，values 兼容单条导入。"""
+
+    items: list[dict[str, Any]] = Field(default_factory=list)
+    values: dict[str, Any] | None = None
+
+
+def _collect_items(items: list[dict[str, Any]], values: dict[str, Any] | None) -> list[dict[str, Any]]:
+    batch = list(items)
+    if values:
+        batch.append(values)
+    return batch
+
+
+def _run_import(items: list[dict[str, Any]]) -> dict[str, Any]:
+    if not items:
+        return {"ok": False, "message": "批次为空，没有可导入的推荐召回修复明细", "accepted": [], "rejected": [], "duplicated": []}
+    result = service.import_repairs(items)
+    accepted = result["accepted"]
+    rejected = result["rejected"]
+    duplicated = result["duplicated"]
+    ok = bool(accepted) or (not rejected)
+    message = f"批次接收 {len(accepted)} 条，重复 {len(duplicated)} 条，拒绝 {len(rejected)} 条"
+    return {
+        "ok": ok,
+        "message": message,
+        "accepted": accepted,
+        "rejected": rejected,
+        "duplicated": duplicated,
+    }
 
 
 @router.get("", response_model=PageResult[dict])
@@ -28,6 +62,36 @@ def list_entries(
         raise HTTPException(status_code=400, detail="每页最多 200 条，请缩小分页范围")
     items, total = service.list_entries(keyword=keyword, status=status, page=page, size=size)
     return PageResult(items=items, total=total, page=page, size=size)
+
+
+@router.post("/import")
+def import_repairs(payload: RepairImportPayload) -> dict[str, Any]:
+    """接收推荐召回修复明细批次：只接纳有效记录，并发上传与重试按故障链路去重。"""
+    return _run_import(_collect_items(payload.items, payload.values))
+
+
+@router.post("/import/file")
+async def import_repairs_file(file: UploadFile) -> dict[str, Any]:
+    """文件上传通道：上传 JSON 批次文件，内容与导入接口同口径校验。"""
+    raw = await file.read()
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {"ok": False, "message": "批次文件不是有效的 JSON，未接纳任何明细", "accepted": [], "rejected": [], "duplicated": []}
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = _collect_items(payload.get("items") or [], payload.get("values"))
+    else:
+        return {"ok": False, "message": "批次文件结构无法识别，未接纳任何明细", "accepted": [], "rejected": [], "duplicated": []}
+    return _run_import(items)
+
+
+@router.get("/export")
+def export_entries() -> dict[str, Any]:
+    """导出智能推荐清单：返回当前过滤条件下的全量数据。"""
+    items, total = service.list_entries(page=1, size=10000)
+    return {"module": "recommend", "total": total, "items": items}
 
 
 @router.get("/{entry_id}", response_model=dict)
@@ -56,10 +120,3 @@ def run_action(entry_id: int, payload: EntryPayload) -> ActionResult:
     if entry is None:
         return ActionResult(ok=False, message=message)
     return ActionResult(ok=True, message=message, entry=entry)
-
-
-@router.get("/export")
-def export_entries() -> dict[str, Any]:
-    """导出智能推荐清单：返回当前过滤条件下的全量数据。"""
-    items, total = service.list_entries(page=1, size=10000)
-    return {"module": "recommend", "total": total, "items": items}
